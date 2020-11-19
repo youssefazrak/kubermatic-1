@@ -17,7 +17,6 @@ limitations under the License.
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/xml"
@@ -27,10 +26,7 @@ import (
 	"io/ioutil"
 	"net/http"
 	"os"
-	"os/exec"
 	"path"
-	"strconv"
-	"strings"
 	"time"
 
 	"github.com/go-openapi/runtime"
@@ -355,11 +351,8 @@ func (r *testRunner) executeScenario(log *zap.SugaredLogger, scenario testScenar
 		return report, err
 	}
 
-	if !r.deleteClusterAfterTests {
-		return report, nil
-	}
 
-	return report, r.deleteCluster(report, cluster, log)
+	return nil,nil
 }
 
 func (r *testRunner) executeTests(
@@ -424,16 +417,6 @@ func (r *testRunner) executeTests(
 	_, exists := r.seed.Spec.Datacenters[cluster.Spec.Cloud.DatacenterName]
 	if !exists {
 		return fmt.Errorf("datacenter %q doesn't exist", cluster.Spec.Cloud.DatacenterName)
-	}
-
-	kubeconfigFilename, err := r.getKubeconfig(log, cluster)
-	if err != nil {
-		return fmt.Errorf("failed to get kubeconfig: %v", err)
-	}
-
-	cloudConfigFilename, err := r.getCloudConfig(log, cluster)
-	if err != nil {
-		return fmt.Errorf("failed to get cloud config: %v", err)
 	}
 
 	userClusterClient, err := r.clusterClientProvider.GetClient(cluster)
@@ -529,18 +512,6 @@ func (r *testRunner) executeTests(
 		return nil
 	}
 
-	if err := r.testCluster(
-		log,
-		scenario,
-		cluster,
-		userClusterClient,
-		kubeconfigFilename,
-		cloudConfigFilename,
-		report,
-	); err != nil {
-		return fmt.Errorf("failed to test cluster: %v", err)
-	}
-
 	return nil
 }
 
@@ -609,221 +580,6 @@ func (r *testRunner) deleteCluster(report *reporters.JUnitTestSuite, cluster *ku
 	}
 
 	return nil
-}
-
-func retryNAttempts(maxAttempts int, f func(attempt int) error) error {
-	var err error
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		err = f(attempt)
-		if err != nil {
-			continue
-		}
-		return nil
-	}
-	return fmt.Errorf("function did not succeed after %d attempts: %v", maxAttempts, err)
-}
-
-// measuredRetryNAttempts wraps retryNAttempts with code that counts
-// the executed number of attempts and the runtimes for each
-// attempt.
-func measuredRetryNAttempts(
-	runtimeMetric *prometheus.GaugeVec,
-	//nolint:interfacer
-	attemptsMetric prometheus.Gauge,
-	log *zap.SugaredLogger,
-	maxAttempts int,
-	f func(attempt int) error,
-) func() error {
-	return func() error {
-		attempts := 0
-
-		err := retryNAttempts(maxAttempts, func(attempt int) error {
-			attempts++
-			metric := runtimeMetric.With(prometheus.Labels{"attempt": strconv.Itoa(attempt)})
-
-			return measureTime(metric, log, func() error {
-				return f(attempt)
-			})
-		})
-
-		attemptsMetric.Set(float64(attempts))
-		updateMetrics(log)
-
-		return err
-	}
-}
-
-func (r *testRunner) testCluster(
-	log *zap.SugaredLogger,
-	scenario testScenario,
-	cluster *kubermaticv1.Cluster,
-	userClusterClient ctrlruntimeclient.Client,
-	kubeconfigFilename string,
-	cloudConfigFilename string,
-	report *reporters.JUnitTestSuite,
-) error {
-	const maxTestAttempts = 3
-	// var err error
-	log.Info("Starting to test cluster...")
-
-	if r.openshift {
-		// Openshift supports neither the conformance tests nor PVs/LBs yet :/
-		return nil
-	}
-
-	ginkgoRuns, err := r.getGinkgoRuns(log, scenario, kubeconfigFilename, cloudConfigFilename, cluster)
-	if err != nil {
-		return fmt.Errorf("failed to get Ginkgo runs: %v", err)
-	}
-	for _, run := range ginkgoRuns {
-		if err := junitReporterWrapper(
-			fmt.Sprintf("[Ginkgo] Run ginkgo tests %q", run.name),
-			report,
-			func() error {
-				ginkgoRes, err := r.executeGinkgoRunWithRetries(log, scenario, run, userClusterClient)
-				if ginkgoRes != nil {
-					// We append the report from Ginkgo to our scenario wide report
-					appendReport(report, ginkgoRes.report)
-				}
-				return err
-			},
-		); err != nil {
-			log.Errorf("Ginkgo scenario '%s' failed, giving up retrying: %v", err)
-			// We still want to run potential next runs
-			continue
-		}
-	}
-
-	defaultLabels := prometheus.Labels{
-		"scenario": scenario.Name(),
-	}
-
-	// Do a simple PVC test - with retries
-	if supportsStorage(cluster) {
-		if err := junitReporterWrapper(
-			"[Kubermatic] [CloudProvider] Test PersistentVolumes",
-			report,
-			measuredRetryNAttempts(
-				pvctestRuntimeMetric.MustCurryWith(defaultLabels),
-				pvctestAttemptsMetric.With(defaultLabels),
-				log,
-				maxTestAttempts,
-				func(attempt int) error {
-					return r.testPVC(log, userClusterClient, attempt)
-				},
-			),
-		); err != nil {
-			log.Errorf("Failed to verify that PVC's work: %v", err)
-		}
-	}
-
-	// Do a simple LB test - with retries
-	if supportsLBs(cluster) {
-		if err := junitReporterWrapper(
-			"[Kubermatic] [CloudProvider] Test LoadBalancers",
-			report,
-			measuredRetryNAttempts(
-				lbtestRuntimeMetric.MustCurryWith(defaultLabels),
-				lbtestAttemptsMetric.With(defaultLabels),
-				log,
-				maxTestAttempts,
-				func(attempt int) error {
-					return r.testLB(log, userClusterClient, attempt)
-				},
-			),
-		); err != nil {
-			log.Errorf("Failed to verify that LB's work: %v", err)
-		}
-	}
-
-	// Do user cluster RBAC controller test - with retries
-	if err := junitReporterWrapper(
-		"[Kubermatic] Test user cluster RBAC controller",
-		report,
-		func() error {
-			return retryNAttempts(maxTestAttempts, func(attempt int) error {
-				return r.testUserclusterControllerRBAC(log, cluster, userClusterClient, r.seedClusterClient)
-			})
-		}); err != nil {
-		log.Errorf("Failed to verify that user cluster RBAC controller work: %v", err)
-	}
-
-	// Do prometheus metrics available test - with retries
-	if err := junitReporterWrapper(
-		"[Kubermatic] Test prometheus metrics availability", report, func() error {
-			return retryNAttempts(maxTestAttempts, func(attempt int) error {
-				return r.testUserClusterMetrics(log, cluster, r.seedClusterClient)
-			})
-		}); err != nil {
-		log.Errorf("Failed to verify that prometheus metrics are available: %v", err)
-	}
-
-	// Do pod and node metrics availability test - with retries
-	if err := junitReporterWrapper(
-		"[Kubermatic] Test pod and node metrics availability", report, func() error {
-			return retryNAttempts(maxTestAttempts, func(attempt int) error {
-				return r.testUserClusterPodAndNodeMetrics(log, cluster, userClusterClient)
-			})
-		}); err != nil {
-		log.Errorf("Failed to verify that pod and node metrics are available: %v", err)
-	}
-
-	return nil
-}
-
-// executeGinkgoRunWithRetries executes the passed GinkgoRun and retries if it failed hard(Failed to execute the Ginkgo binary for example)
-// Or if the JUnit report from Ginkgo contains failed tests.
-// Only if Ginkgo failed hard, an error will be returned. If some tests still failed after retrying the run, the report will reflect that.
-func (r *testRunner) executeGinkgoRunWithRetries(log *zap.SugaredLogger, scenario testScenario, run *ginkgoRun, client ctrlruntimeclient.Client) (ginkgoRes *ginkgoResult, err error) {
-	const maxAttempts = 3
-
-	attempts := 1
-	defer func() {
-		ginkgoAttemptsMetric.With(prometheus.Labels{
-			"scenario": scenario.Name(),
-			"run":      run.name,
-		}).Set(float64(attempts))
-		updateMetrics(log)
-	}()
-
-	for attempts = 1; attempts <= maxAttempts; attempts++ {
-		ginkgoRes, err = r.executeGinkgoRun(log, run, client)
-
-		if ginkgoRes != nil {
-			ginkgoRuntimeMetric.With(prometheus.Labels{
-				"scenario": scenario.Name(),
-				"run":      run.name,
-				"attempt":  strconv.Itoa(attempts),
-			}).Set(ginkgoRes.duration.Seconds())
-			updateMetrics(log)
-		}
-
-		if err != nil {
-			// Something critical happened and we don't have a valid result
-			log.Errorf("Failed to execute the Ginkgo run '%s': %v", run.name, err)
-			continue
-		}
-
-		if ginkgoRes.report.Errors > 0 || ginkgoRes.report.Failures > 0 {
-			msg := fmt.Sprintf("Ginkgo run '%s' had failed tests.", run.name)
-			if attempts < maxAttempts {
-				msg = fmt.Sprintf("%s. Retrying...", msg)
-			}
-			log.Info(msg)
-			if r.printGinkoLogs {
-				if err := printFileUnbuffered(ginkgoRes.logfile); err != nil {
-					log.Infof("Error printing ginkgo logfile: %v", err)
-				}
-				log.Info("Successfully printed logfile")
-			}
-			continue
-		}
-
-		// Ginkgo run successfully and no test failed
-		return ginkgoRes, err
-	}
-
-	return ginkgoRes, err
 }
 
 func (r *testRunner) createNodeDeployments(log *zap.SugaredLogger, scenario testScenario, clusterName string) error {
@@ -1107,250 +863,6 @@ func (r *testRunner) waitUntilAllPodsAreReady(log *zap.SugaredLogger, userCluste
 	return nil
 }
 
-type ginkgoResult struct {
-	logfile  string
-	report   *reporters.JUnitTestSuite
-	duration time.Duration
-}
-
-const (
-	argSeparator = ` \
-    `
-)
-
-type ginkgoRun struct {
-	name       string
-	cmd        *exec.Cmd
-	reportsDir string
-	timeout    time.Duration
-}
-
-func (r *testRunner) getGinkgoRuns(
-	log *zap.SugaredLogger,
-	scenario testScenario,
-	kubeconfigFilename,
-	cloudConfigFilename string,
-	cluster *kubermaticv1.Cluster,
-) ([]*ginkgoRun, error) {
-	kubeconfigFilename = path.Clean(kubeconfigFilename)
-	repoRoot := path.Clean(r.repoRoot)
-	MajorMinor := fmt.Sprintf("%d.%d", cluster.Spec.Version.Major(), cluster.Spec.Version.Minor())
-
-	nodeNumberTotal := int32(r.nodeCount)
-
-	ginkgoSkipParallel := `\[Serial\]`
-	if minor := cluster.Spec.Version.Minor(); minor >= 16 && minor <= 19 {
-		// These require the nodes NodePort to be available from the tester, which is not the case for us.
-		// TODO: Maybe add an option to allow the NodePorts in the SecurityGroup?
-		ginkgoSkipParallel = strings.Join([]string{
-			ginkgoSkipParallel,
-			"Services should be able to change the type from ExternalName to NodePort",
-			"Services should be able to create a functioning NodePort service",
-			"Services should be able to switch session affinity for NodePort service",
-			"Services should have session affinity timeout work for NodePort service",
-			"Services should have session affinity work for NodePort service",
-		}, "|")
-	}
-
-	runs := []struct {
-		name          string
-		ginkgoFocus   string
-		ginkgoSkip    string
-		parallelTests int
-		timeout       time.Duration
-	}{
-		{
-			name:          "parallel",
-			ginkgoFocus:   `\[Conformance\]`,
-			ginkgoSkip:    ginkgoSkipParallel,
-			parallelTests: int(nodeNumberTotal) * 3,
-			timeout:       30 * time.Minute,
-		},
-		{
-			name:          "serial",
-			ginkgoFocus:   `\[Serial\].*\[Conformance\]`,
-			ginkgoSkip:    `should not cause race condition when used for configmap`,
-			parallelTests: 1,
-			timeout:       30 * time.Minute,
-		},
-	}
-	versionRoot := path.Join(repoRoot, MajorMinor)
-	binRoot := path.Join(versionRoot, "/platforms/linux/amd64")
-	var ginkgoRuns []*ginkgoRun
-	for _, run := range runs {
-
-		reportsDir := path.Join("/tmp", scenario.Name(), run.name)
-		env := []string{
-			// `kubectl diff` needs to find /usr/bin/diff
-			fmt.Sprintf("PATH=%s", os.Getenv("PATH")),
-			fmt.Sprintf("HOME=%s", r.homeDir),
-			fmt.Sprintf("AWS_SSH_KEY=%s", path.Join(r.homeDir, ".ssh", "google_compute_engine")),
-			fmt.Sprintf("LOCAL_SSH_KEY=%s", path.Join(r.homeDir, ".ssh", "google_compute_engine")),
-			fmt.Sprintf("KUBE_SSH_KEY=%s", path.Join(r.homeDir, ".ssh", "google_compute_engine")),
-		}
-
-		args := []string{
-			"-progress",
-			fmt.Sprintf("-nodes=%d", run.parallelTests),
-			"-noColor=true",
-			"-flakeAttempts=2",
-			fmt.Sprintf(`-focus=%s`, run.ginkgoFocus),
-			fmt.Sprintf(`-skip=%s`, run.ginkgoSkip),
-			path.Join(binRoot, "e2e.test"),
-			"--",
-			"--disable-log-dump",
-			fmt.Sprintf("--repo-root=%s", versionRoot),
-			fmt.Sprintf("--report-dir=%s", reportsDir),
-			fmt.Sprintf("--report-prefix=%s", run.name),
-			fmt.Sprintf("--kubectl-path=%s", path.Join(binRoot, "kubectl")),
-			fmt.Sprintf("--kubeconfig=%s", kubeconfigFilename),
-			fmt.Sprintf("--num-nodes=%d", nodeNumberTotal),
-			fmt.Sprintf("--cloud-config-file=%s", cloudConfigFilename),
-		}
-
-		args = append(args, "--provider=local")
-
-		osSpec := scenario.OS()
-		switch {
-		case osSpec.Ubuntu != nil:
-			args = append(args, "--node-os-distro=ubuntu")
-			env = append(env, "KUBE_SSH_USER=ubuntu")
-		case osSpec.Centos != nil:
-			args = append(args, "--node-os-distro=centos")
-			env = append(env, "KUBE_SSH_USER=centos")
-		case osSpec.ContainerLinux != nil:
-			args = append(args, "--node-os-distro=coreos")
-			env = append(env, "KUBE_SSH_USER=core")
-		case osSpec.Flatcar != nil:
-			args = append(args, "--node-os-distro=flatcar")
-			env = append(env, "KUBE_SSH_USER=core")
-		}
-
-		cmd := exec.Command(path.Join(binRoot, "ginkgo"), args...)
-		cmd.Env = env
-
-		ginkgoRuns = append(ginkgoRuns, &ginkgoRun{
-			name:       run.name,
-			cmd:        cmd,
-			reportsDir: reportsDir,
-			timeout:    run.timeout,
-		})
-	}
-
-	return ginkgoRuns, nil
-}
-
-func (r *testRunner) executeGinkgoRun(parentLog *zap.SugaredLogger, run *ginkgoRun, client ctrlruntimeclient.Client) (*ginkgoResult, error) {
-	log := parentLog.With("reports-dir", run.reportsDir)
-
-	if err := r.deleteAllNonDefaultNamespaces(log, client); err != nil {
-		return nil, fmt.Errorf("failed to cleanup namespaces before the Ginkgo run: %v", err)
-	}
-
-	// We're clearing up the temp dir on every run
-	if err := os.RemoveAll(run.reportsDir); err != nil {
-		log.Errorw("Failed to remove temporary reports directory", zap.Error(err))
-	}
-	if err := os.MkdirAll(run.reportsDir, os.ModePerm); err != nil {
-		return nil, fmt.Errorf("failed to create temporary reports directory: %v", err)
-	}
-
-	// Make sure we write to a file instead of a byte buffer as the logs are pretty big
-	file, err := ioutil.TempFile("/tmp", run.name+"-log")
-	if err != nil {
-		return nil, fmt.Errorf("failed to open logfile: %v", err)
-	}
-	defer file.Close()
-	log = log.With("ginkgo-log", file.Name())
-
-	writer := bufio.NewWriter(file)
-	defer writer.Flush()
-
-	started := time.Now()
-	ctx, cancel := context.WithTimeout(context.Background(), run.timeout)
-	defer cancel()
-
-	// Copy the command as we cannot execute a command twice
-	cmd := exec.CommandContext(ctx, "")
-	cmd.Path = run.cmd.Path
-	cmd.Args = run.cmd.Args
-	cmd.Env = run.cmd.Env
-	cmd.Dir = run.cmd.Dir
-	cmd.ExtraFiles = run.cmd.ExtraFiles
-	if _, err := writer.Write([]byte(strings.Join(cmd.Args, argSeparator))); err != nil {
-		return nil, fmt.Errorf("failed to write command to log: %v", err)
-	}
-
-	log.Infof("Starting Ginkgo run '%s'...", run.name)
-
-	// Flush to disk so we can actually watch logs
-	stopCh := make(chan struct{}, 1)
-	defer close(stopCh)
-	go wait.Until(func() {
-		if err := writer.Flush(); err != nil {
-			log.Warnw("Failed to flush log writer", zap.Error(err))
-		}
-		if err := file.Sync(); err != nil {
-			log.Warnw("Failed to sync log file", zap.Error(err))
-		}
-	}, 1*time.Second, stopCh)
-
-	cmd.Stdout = writer
-	cmd.Stderr = writer
-
-	if err := cmd.Run(); err != nil {
-		// did the context's timeout kick in?
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, ctxErr
-		}
-
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			log.Debugf("Ginkgo exited with a non-zero return code %d: %v", exitErr.ExitCode(), exitErr)
-		} else {
-			return nil, fmt.Errorf("ginkgo failed to start: %T %v", err, err)
-		}
-	}
-
-	log.Debug("Ginkgo run completed, collecting reports...")
-
-	// When running ginkgo in parallel, each ginkgo worker creates a own report, thus we must combine them
-	combinedReport, err := collectReports(run.name, run.reportsDir)
-	if err != nil {
-		return nil, err
-	}
-
-	// If we have no junit files, we cannot return a valid report
-	if len(combinedReport.TestCases) == 0 {
-		return nil, errors.New("Ginkgo report is empty, it seems no tests where executed")
-	}
-
-	combinedReport.Time = time.Since(started).Seconds()
-
-	log.Infof("Ginkgo run '%s' took %s", run.name, time.Since(started))
-	return &ginkgoResult{
-		logfile:  file.Name(),
-		report:   combinedReport,
-		duration: time.Since(started),
-	}, nil
-}
-
-func supportsStorage(cluster *kubermaticv1.Cluster) bool {
-	return cluster.Spec.Cloud.Openstack != nil ||
-		cluster.Spec.Cloud.Azure != nil ||
-		cluster.Spec.Cloud.AWS != nil ||
-		cluster.Spec.Cloud.VSphere != nil ||
-		cluster.Spec.Cloud.GCP != nil
-
-	// Currently broken, see https://github.com/kubermatic/kubermatic/issues/3312
-	//cluster.Spec.Cloud.Hetzner != nil
-}
-
-func supportsLBs(cluster *kubermaticv1.Cluster) bool {
-	return cluster.Spec.Cloud.Azure != nil ||
-		cluster.Spec.Cloud.AWS != nil ||
-		cluster.Spec.Cloud.GCP != nil
-}
-
 func (r *testRunner) printAllControlPlaneLogs(log *zap.SugaredLogger, clusterName string) {
 	log.Info("Printing control plane logs")
 	cluster := &kubermaticv1.Cluster{}
@@ -1434,15 +946,6 @@ func nodeIsReady(node corev1.Node) bool {
 		}
 	}
 	return false
-}
-
-func printFileUnbuffered(filename string) error {
-	fd, err := os.Open(filename)
-	if err != nil {
-		return err
-	}
-	defer fd.Close()
-	return printUnbuffered(fd)
 }
 
 // printUnbuffered uses io.Copy to print data to stdout.
